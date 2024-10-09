@@ -2,241 +2,187 @@ import collections
 import pandas as pd
 import numpy as np
 import tensorflow as tf
-import tensorflow_federated as tff
-import nest_asyncio
 import os
-import asyncio
-from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.model_selection import KFold
-import random
+import tensorflow_federated as tff
+import csv
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler, LabelEncoder
 
-# Setting GPU environment
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = '1'
 
-# Ensure event loop is set properly
+np.random.seed(1337)
+import nest_asyncio
+
 nest_asyncio.apply()
-try:
-    asyncio.get_running_loop()
-except RuntimeError:
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
 
-# Load the dataset 'data1'
-data = pd.read_csv('data1.csv', header=0)
+# Load the dataset
+data = pd.read_csv('data1.csv')
 
-# Extract features and labels
+# Data Cleaning
+# Replace inf/-inf values with NaN
+data.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+# Separate features and labels
 features = data.iloc[:, :-1]
-labels = data['marker']
+labels = data.iloc[:, -1]
 
-# Encode the labels into binary values (Natural: 0, Attack: 1)
+# Impute missing values using the mean strategy for features
+imputer = SimpleImputer(strategy='mean')
+features_imputed = pd.DataFrame(imputer.fit_transform(features), columns=features.columns)
+
+# Convert labels from 'natural'/'attack' to binary (0 and 1)
 label_encoder = LabelEncoder()
-labels = label_encoder.fit_transform(labels)
+labels_encoded = label_encoder.fit_transform(labels)
 
-# Clip labels to ensure they are strictly binary (0 or 1)
-labels = np.clip(labels, 0, 1)
-
-# Ensure all data is in numeric format
-def preprocess_features(df):
-    for column in df.columns:
-        if df[column].dtype == 'object':
-            df[column] = LabelEncoder().fit_transform(df[column])
-    df = df.replace([np.inf, -np.inf], np.nan)
-    df = df.fillna(0)
-    return df
-
-features = preprocess_features(features)
-
-# Normalize the features using StandardScaler (Z-score normalization)
+# Standardize features (Z-score standardization)
 scaler = StandardScaler()
-features = scaler.fit_transform(features)
+features_scaled = scaler.fit_transform(features_imputed)
 
-# Set the number of clients
-CLIENTS_NUM = 5
-
-# Perform tenfold cross-validation
-kf = KFold(n_splits=10, shuffle=True, random_state=42)
-fold = 1
-all_metrics = []
-
-# Genetic Algorithm parameters
-POPULATION_SIZE = 30  # Population size
-GENERATIONS = 10  # Number of generations
-CROSSOVER_RATE = 0.8  # Crossover probability
-MUTATION_RATE = 0.2  # Mutation probability
-
-# Define the model creation using parameters
-class GeneticCNN:
-    def __init__(self, num_features):
-        self.num_features = num_features
-        self.population = self.initialise_population()
-
-    def initialise_population(self):
-        population = []
-        for _ in range(POPULATION_SIZE):
-            individual = {
-                'layers': random.randint(2, 5),  # Number of convolutional blocks
-                'filters': [random.randint(16, 64) for _ in range(5)],  # Number of filters per block
-                'kernel_size': [random.choice([3, 5]) for _ in range(5)],  # Kernel size per block
-                'activation': random.choice(['relu', 'tanh']),
-                'pool_size': random.choice([2, 3])  # Pooling size
-            }
-            population.append(individual)
-        return population
-
-    def create_keras_model(self, individual):
-        model = tf.keras.Sequential()
-        model.add(tf.keras.layers.InputLayer(input_shape=(self.num_features,)))
-        model.add(tf.keras.layers.Reshape((self.num_features, 1)))  # Reshape to add an extra dimension for Conv1D
-        for i in range(individual['layers']):
-            model.add(tf.keras.layers.Conv1D(individual['filters'][i], individual['kernel_size'][i], activation=individual['activation'], padding='same'))
-            pool_size = min(individual['pool_size'], model.output_shape[1])
-            model.add(tf.keras.layers.MaxPooling1D(pool_size=pool_size))
-            model.add(tf.keras.layers.BatchNormalization())
-        model.add(tf.keras.layers.Flatten())
-        model.add(tf.keras.layers.Dense(1, activation='sigmoid'))
-        return model
-
-    def fitness(self, individual, X_train, y_train, X_val, y_val):
-        model = self.create_keras_model(individual)
-        model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
-        model.fit(X_train, y_train, epochs=10, batch_size=32, verbose=0)
-        _, accuracy = model.evaluate(X_val, y_val, verbose=0)
-        return accuracy
-
-    def select_parents(self, population, fitness_scores):
-        selected = random.sample(list(zip(population, fitness_scores)), 5)  # 5-way tournament selection
-        selected.sort(key=lambda x: x[1], reverse=True)
-        return selected[0][0], selected[1][0]
-
-    def crossover(self, parent1, parent2):
-        child1, child2 = parent1.copy(), parent2.copy()
-        if random.random() < CROSSOVER_RATE:
-            crossover_point = random.randint(0, len(parent1['filters']) - 1)
-            for key in parent1.keys():
-                if isinstance(parent1[key], list):
-                    child1[key][:crossover_point], child2[key][:crossover_point] = parent2[key][:crossover_point], parent1[key][:crossover_point]
-                else:
-                    child1[key], child2[key] = (parent1[key], parent2[key]) if random.random() < 0.5 else (parent2[key], parent1[key])
-        return child1, child2
-
-    def mutate(self, individual):
-        if random.random() < MUTATION_RATE:
-            mutation_point = random.choice(list(individual.keys()))
-            if mutation_point == 'layers':
-                individual['layers'] = random.randint(2, 5)
-            elif mutation_point == 'filters':
-                individual['filters'] = [random.randint(16, 64) for _ in range(5)]
-            elif mutation_point == 'kernel_size':
-                individual['kernel_size'] = [random.choice([3, 5]) for _ in range(5)]
-            elif mutation_point == 'activation':
-                individual['activation'] = random.choice(['relu', 'tanh'])
-            elif mutation_point == 'pool_size':
-                individual['pool_size'] = random.choice([2, 3])
-        return individual
-
-    def evolve_population(self, X_train, y_train, X_val, y_val):
-        for generation in range(GENERATIONS):
-            fitness_scores = [self.fitness(ind, X_train, y_train, X_val, y_val) for ind in self.population]
-            new_population = []
-            while len(new_population) < POPULATION_SIZE:
-                parent1, parent2 = self.select_parents(self.population, fitness_scores)
-                child1, child2 = self.crossover(parent1, parent2)
-                child1 = self.mutate(child1)
-                child2 = self.mutate(child2)
-                new_population.extend([child1, child2])
-            self.population = new_population[:POPULATION_SIZE]
-            print(f'Generation {generation + 1} best accuracy: {max(fitness_scores)}')
-
-# Preprocess function for federated dataset
-def preprocess(dataset):
-    def map_fn(input, label):
-        return collections.OrderedDict(
-            x=input,
-            y=label
-        )
-    return dataset.map(map_fn)
+# Combine scaled features with the label
+data_processed = pd.DataFrame(features_scaled, columns=features.columns)
+data_processed['Label'] = labels_encoded
 
 # Split the dataset into training and testing sets
-for train_index, test_index in kf.split(features):
-    X_train, X_test = features[train_index], features[test_index]
-    y_train, y_test = labels[train_index], labels[test_index]
+traindata = data_processed.sample(frac=0.8, random_state=42)
+testdata = data_processed.drop(traindata.index)
 
-    # Split training data among clients
-    train_data = pd.concat([pd.DataFrame(X_train), pd.Series(y_train, name='label')], axis=1)
-    split_train_data = np.array_split(train_data, CLIENTS_NUM)
+# Reset index
+traindata = traindata.reset_index(drop=True)
+testdata = testdata.reset_index(drop=True)
 
-    # Create TensorFlow datasets for each client
-    train_ds = []
-    for client_data in split_train_data:
-        dataset = tf.data.Dataset.from_tensor_slices((
-            client_data.iloc[:, :-1].values.astype(np.float32),  # Features
-            client_data['label'].values.astype(np.float32)       # Labels
-        )).batch(32)
-        train_ds.append(dataset)
+# Define constants
+CLIENTS_NUM = 5
+ROUND_NUM = 200
+client_lr = 0.02
+server_lr = 1.0
+batchSize = 64
 
-    # Prepare test dataset
-    test_data = tf.data.Dataset.from_tensor_slices((
-        X_test.astype(np.float32),
-        y_test.astype(np.float32)
-    )).batch(32)
+# Split training data among clients
+split_train_data = []
+remain_traindata = traindata
+for i in range(CLIENTS_NUM):
+    temp_split_train_data = traindata.sample(frac=1 / CLIENTS_NUM)
+    temp_split_train_data = temp_split_train_data.reset_index(drop=True)
+    split_train_data.append(temp_split_train_data)
+    remain_traindata = traindata[~traindata.index.isin(temp_split_train_data.index)]
 
-    # Prepare federated dataset
-    client_ids = list(range(CLIENTS_NUM))
-    federated_train_data = [preprocess(dataset) for dataset in train_ds]
+# Split testing data among clients
+split_test_data = []
+remain_testdata = testdata
+for i in range(CLIENTS_NUM):
+    temp_split_test_data = testdata.sample(frac=1 / CLIENTS_NUM)
+    temp_split_test_data = temp_split_test_data.reset_index(drop=True)
+    split_test_data.append(temp_split_test_data)
+    remain_testdata = testdata[~testdata.index.isin(temp_split_test_data.index)]
 
-    genetic_cnn = GeneticCNN(num_features=X_train.shape[1])
-    genetic_cnn.evolve_population(X_train, y_train, X_test, y_test)
+# Map clients to datasets
+client_ids = [x for x in range(CLIENTS_NUM)]
+train_ds = {}
+for i in range(CLIENTS_NUM):
+    cur_traindata = split_train_data[i]
+    train_ds[i] = tf.data.Dataset.from_tensor_slices(cur_traindata)
 
-    # Train the best model
-    best_model_params = genetic_cnn.population[0]
-    final_model = genetic_cnn.create_keras_model(best_model_params)
+test_ds = {}
+for i in range(CLIENTS_NUM):
+    cur_testdata = split_test_data[i]
+    test_ds[i] = tf.data.Dataset.from_tensor_slices(cur_testdata)
 
-    # Define TFF model
-    def model_fn():
-        return tff.learning.from_keras_model(
-            final_model,
-            input_spec=federated_train_data[0].element_spec,
-            loss=tf.keras.losses.BinaryCrossentropy(),
-            metrics=[
-                tf.keras.metrics.BinaryAccuracy(),
-                tf.keras.metrics.Precision(),
-                tf.keras.metrics.Recall(),
-                tf.keras.metrics.AUC(name='auc')
-            ]
+
+def create_tf_traindataset_for_client_fn(i):
+    return train_ds[i]
+
+
+def create_tf_testdataset_for_client_fn(i):
+    return test_ds[i]
+
+
+# Create ClientData objects
+TrainData4Client = tff.simulation.ClientData.from_clients_and_fn(client_ids, create_tf_traindataset_for_client_fn)
+TestData4Client = tff.simulation.ClientData.from_clients_and_fn(client_ids, create_tf_testdataset_for_client_fn)
+
+# Sample clients
+sample_clients = TrainData4Client.client_ids[0:CLIENTS_NUM]
+
+
+# Preprocess dataset
+def preprocess_dataset(dataset):
+    def map_fn(input):
+        return collections.OrderedDict(
+            x=tf.reshape(input[:, :-1], [-1, 128]),  # Adjusted to 128 features
+            y=tf.reshape(input[:, -1], [-1, 1])
         )
 
-    # Federated Averaging process definition
-    fed_avg = tff.learning.build_federated_averaging_process(
-        model_fn,
-        client_optimizer_fn=lambda: tf.keras.optimizers.Adam(learning_rate=0.0005),
-        server_optimizer_fn=lambda: tf.keras.optimizers.SGD(learning_rate=0.001)
+    return dataset.batch(batchSize).map(map_fn).take(120000)
+
+
+# Generate federated datasets
+federated_train_datasets = [preprocess_dataset(TrainData4Client.create_tf_dataset_for_client(x)) for x in
+                            sample_clients]
+federated_test_datasets = [preprocess_dataset(TestData4Client.create_tf_dataset_for_client(x)) for x in sample_clients]
+
+input_spec = federated_train_datasets[0].element_spec
+
+
+# Federated Learning Model
+def create_keras_model():
+    model = tf.keras.Sequential()
+    model.add(tf.keras.layers.Dense(1024, input_dim=128, activation=tf.nn.relu))  # Adjusted input_dim to 128
+    model.add(tf.keras.layers.Dropout(0.01))
+    model.add(tf.keras.layers.Dense(1))
+    model.add(tf.keras.layers.Activation('sigmoid'))
+    return model
+
+
+def model_fn():
+    model = create_keras_model()
+    return tff.learning.from_keras_model(
+        keras_model=model,
+        input_spec=input_spec,
+        loss=tf.keras.losses.BinaryCrossentropy(),
+        metrics=[tf.keras.metrics.Accuracy(), tf.keras.metrics.Recall(), tf.keras.metrics.Precision()]
     )
 
-    # Initialize the federated learning process
-    state = fed_avg.initialize()
 
+fed_aver = tff.learning.build_federated_averaging_process(
+    model_fn,
+    client_optimizer_fn=lambda: tf.keras.optimizers.Adam(learning_rate=client_lr),
+    server_optimizer_fn=lambda: tf.keras.optimizers.Adam(learning_rate=server_lr)
+)
+
+state = fed_aver.initialize()
+
+logdir_for_compression = "/tmp/logs/scalars/custom_model/"
+summary_writer = tf.summary.create_file_writer(logdir_for_compression)
+
+f1 = open('evaluation.csv', 'w', encoding='utf-8')
+f2 = open('test_evaluation.csv', 'w', encoding='utf-8')
+csv_writer_train = csv.writer(f1)
+csv_writer_test = csv.writer(f2)
+
+csv_writer_train.writerow(["loss", "accuracy", "recall", "precision", "f1-score"])
+csv_writer_test.writerow(["loss", "accuracy", "recall", "precision", "f1-score"])
+
+with summary_writer.as_default():
     # Training loop
-    NUM_ROUNDS = 200
-    for round_num in range(NUM_ROUNDS):
-        state, metrics = fed_avg.next(state, federated_train_data)
-        print(f'Fold {fold}, Round {round_num + 1}, Metrics: {metrics}')
+    for i in range(ROUND_NUM):
+        state, metrics = fed_aver.next(state, federated_train_datasets)
+        test_state, test_metrics = fed_aver.next(state, federated_test_datasets)
+        train_f1_score = 2 * metrics['train']['recall'] * metrics['train']['precision'] / (
+                    metrics['train']['recall'] + metrics['train']['precision'])
+        test_f1_score = 2 * test_metrics['train']['recall'] * test_metrics['train']['precision'] / (
+                    test_metrics['train']['recall'] + test_metrics['train']['precision'])
 
-    # Evaluate the model on the test data
-    state.model.assign_weights_to(final_model)
+        print(
+            f'Round {i}: Train Loss: {metrics["train"]["loss"]}, Accuracy: {metrics["train"]["accuracy"]}, Recall: {metrics["train"]["recall"]}, Precision: {metrics["train"]["precision"]}, F1-score: {train_f1_score}\n')
+        csv_writer_train.writerow([metrics['train']['loss'], metrics['train']['accuracy'], metrics['train']['recall'],
+                                   metrics['train']['precision'], train_f1_score])
 
-    # Evaluate on test data
-    test_metrics = final_model.evaluate(test_data, return_dict=True)
-    print(f'Fold {fold}, Test Metrics:', test_metrics)
-    all_metrics.append(test_metrics)
-    fold += 1
+        print(
+            f'Round {i}: Test Loss: {test_metrics["train"]["loss"]}, Accuracy: {test_metrics["train"]["accuracy"]}, Recall: {test_metrics["train"]["recall"]}, Precision: {test_metrics["train"]["precision"]}, F1-score: {test_f1_score}\n')
+        csv_writer_test.writerow(
+            [test_metrics['train']['loss'], test_metrics['train']['accuracy'], test_metrics['train']['recall'],
+             test_metrics['train']['precision'], test_f1_score])
 
-# Print average metrics across all folds
-average_metrics = {key: np.mean([m[key] for m in all_metrics]) for key in all_metrics[0].keys()}
-print('Average Test Metrics:', average_metrics)
-
-# Calculate F1-score
-average_precision = average_metrics['precision']
-average_recall = average_metrics['recall']
-average_f1_score = 2 * (average_precision * average_recall) / (average_precision + average_recall)
-print('Average F1 Score:', average_f1_score)
+f1.close()
+f2.close()
