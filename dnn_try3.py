@@ -7,6 +7,7 @@ import tensorflow_federated as tff
 import csv
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.model_selection import ParameterGrid
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = '1'
@@ -16,66 +17,170 @@ import nest_asyncio
 
 nest_asyncio.apply()
 
-# 加载数据集
-data1 = pd.read_csv('data1.csv')
-data2 = pd.read_csv('data2.csv')
+# Load the dataset
+data = pd.read_csv('data1.csv')
 
-# 数据清理函数
-def clean_data(data):
-    # 将 inf/-inf 值替换为 NaN
-    data.replace([np.inf, -np.inf], np.nan, inplace=True)
+# Data Cleaning
+# Replace inf/-inf values with NaN
+data.replace([np.inf, -np.inf], np.nan, inplace=True)
 
-    # 处理异常 0 值
-    columns_to_check = data.columns[:-1]  # 忽略最后一列（标签列）
+# Separate features and labels
+features = data.iloc[:, :-1]
+labels = data.iloc[:, -1]
 
-    for column in columns_to_check:
-        zero_count = (data[column] == 0).sum()
-        total_count = len(data[column])
-        zero_ratio = zero_count / total_count
-
-        if zero_ratio <= 0.5:
-            # 打印出要删除的行
-            rows_to_delete = data[data[column] == 0]
-            print(f"列 {column} 中的 0 值占比较低，删除以下行：\n{rows_to_delete}")
-            # 删除包含 0 值的行
-            data = data[data[column] != 0]
-
-    return data
-
-# 对 data1 和 data2 进行清理
-data1 = clean_data(data1)
-data2 = clean_data(data2)
-
-# 分离特征和标签
-features1 = data1.iloc[:, :-1]
-labels1 = data1.iloc[:, -1]
-features2 = data2.iloc[:, :-1]
-labels2 = data2.iloc[:, -1]
-
-# 对特征进行缺失值填充和标准化
+# Impute missing values using the mean strategy for features
 imputer = SimpleImputer(strategy='mean')
-scaler = StandardScaler()
+features_imputed = pd.DataFrame(imputer.fit_transform(features), columns=features.columns)
 
-# 训练集处理
-features1_imputed = pd.DataFrame(imputer.fit_transform(features1), columns=features1.columns)
-features1_scaled = scaler.fit_transform(features1_imputed)
-
-# 测试集处理
-features2_imputed = pd.DataFrame(imputer.transform(features2), columns=features2.columns)
-features2_scaled = scaler.transform(features2_imputed)
-
-# 标签二值化
+# Convert labels from 'natural'/'attack' to binary (0 and 1)
 label_encoder = LabelEncoder()
-labels1_encoded = label_encoder.fit_transform(labels1)
-labels2_encoded = label_encoder.fit_transform(labels2)
+labels_encoded = label_encoder.fit_transform(labels)
 
-# 组合处理后的特征和标签
-train_data_processed = pd.DataFrame(features1_scaled, columns=features1.columns)
-train_data_processed['Label'] = labels1_encoded
+# Standardize features (Z-score standardization)
+scaler = StandardScaler()
+features_scaled = scaler.fit_transform(features_imputed)
 
-test_data_processed = pd.DataFrame(features2_scaled, columns=features2.columns)
-test_data_processed['Label'] = labels2_encoded
+# Combine scaled features with the label
+data_processed = pd.DataFrame(features_scaled, columns=features.columns)
+data_processed['Label'] = labels_encoded
 
-# 将处理好的训练集和测试集保存为新文件
-train_data_processed.to_csv('processed_training.csv', index=False)
-test_data_processed.to_csv('processed_testing.csv', index=False)
+# Split the dataset into training and testing sets
+traindata = data_processed.sample(frac=0.8, random_state=129)
+testdata = data_processed.drop(traindata.index)
+
+# Reset index
+traindata = traindata.reset_index(drop=True)
+testdata = testdata.reset_index(drop=True)
+
+# Define constants
+CLIENTS_NUM = 5
+ROUND_NUM = 200
+batchSize = 64
+
+# 超参数搜索空间
+param_grid = {
+    'client_lr': [0.001, 0.01, 0.02],
+    'server_lr': [0.1, 0.5, 1.0],
+    'dropout_rate': [0.01, 0.1, 0.2],
+    'units': [1024, 2048]
+}
+
+# Split training data among clients
+split_train_data = []
+remain_traindata = traindata
+for i in range(CLIENTS_NUM):
+    temp_split_train_data = traindata.sample(frac=1 / CLIENTS_NUM)
+    temp_split_train_data = temp_split_train_data.reset_index(drop=True)
+    split_train_data.append(temp_split_train_data)
+    remain_traindata = traindata[~traindata.index.isin(temp_split_train_data.index)]
+
+# Split testing data among clients
+split_test_data = []
+remain_testdata = testdata
+for i in range(CLIENTS_NUM):
+    temp_split_test_data = testdata.sample(frac=1 / CLIENTS_NUM)
+    temp_split_test_data = temp_split_test_data.reset_index(drop=True)
+    split_test_data.append(temp_split_test_data)
+    remain_testdata = testdata[~testdata.index.isin(temp_split_test_data.index)]
+
+# Map clients to datasets
+client_ids = [x for x in range(CLIENTS_NUM)]
+train_ds = {}
+for i in range(CLIENTS_NUM):
+    cur_traindata = split_train_data[i]
+    train_ds[i] = tf.data.Dataset.from_tensor_slices(cur_traindata)
+
+test_ds = {}
+for i in range(CLIENTS_NUM):
+    cur_testdata = split_test_data[i]
+    test_ds[i] = tf.data.Dataset.from_tensor_slices(cur_testdata)
+
+
+def create_tf_traindataset_for_client_fn(i):
+    return train_ds[i]
+
+
+def create_tf_testdataset_for_client_fn(i):
+    return test_ds[i]
+
+
+# Create ClientData objects
+TrainData4Client = tff.simulation.ClientData.from_clients_and_fn(client_ids, create_tf_traindataset_for_client_fn)
+TestData4Client = tff.simulation.ClientData.from_clients_and_fn(client_ids, create_tf_testdataset_for_client_fn)
+
+# Sample clients
+sample_clients = TrainData4Client.client_ids[0:CLIENTS_NUM]
+
+
+# Preprocess dataset
+def preprocess_dataset(dataset):
+    def map_fn(input):
+        return collections.OrderedDict(
+            x=tf.reshape(input[:, :-1], [-1, 128]),  # Adjusted to 128 features
+            y=tf.reshape(input[:, -1], [-1, 1])
+        )
+
+    return dataset.batch(batchSize).map(map_fn)
+
+
+# Generate federated datasets
+federated_train_datasets = [preprocess_dataset(TrainData4Client.create_tf_dataset_for_client(x)) for x in
+                            sample_clients]
+federated_test_datasets = [preprocess_dataset(TestData4Client.create_tf_dataset_for_client(x)) for x in sample_clients]
+
+input_spec = federated_train_datasets[0].element_spec
+
+
+# Federated Learning Model
+def create_keras_model(units, dropout_rate):
+    model = tf.keras.Sequential()
+    model.add(tf.keras.layers.Dense(units, input_dim=128, activation=tf.nn.elu))  # Adjusted input_dim to 128
+    model.add(tf.keras.layers.Dropout(dropout_rate))
+    model.add(tf.keras.layers.Dense(1))
+    model.add(tf.keras.layers.Activation('sigmoid'))
+    return model
+
+
+def model_fn(params):
+    model = create_keras_model(params['units'], params['dropout_rate'])
+    return tff.learning.from_keras_model(
+        keras_model=model,
+        input_spec=input_spec,
+        loss=tf.keras.losses.BinaryCrossentropy(),
+        metrics=[tf.keras.metrics.Accuracy(), tf.keras.metrics.Recall(), tf.keras.metrics.Precision()]
+    )
+
+
+# 超参数搜索
+best_score = 0
+best_params = None
+grid = ParameterGrid(param_grid)
+
+for params in grid:
+    print(f"Evaluating params: {params}")
+
+    fed_aver = tff.learning.build_federated_averaging_process(
+        lambda: model_fn(params),
+        client_optimizer_fn=lambda: tf.keras.optimizers.Adam(learning_rate=params['client_lr']),
+        server_optimizer_fn=lambda: tf.keras.optimizers.Adam(learning_rate=params['server_lr'])
+    )
+
+    state = fed_aver.initialize()
+
+    # Train and evaluate the model with current params
+    for i in range(ROUND_NUM):
+        state, metrics = fed_aver.next(state, federated_train_datasets)
+
+    # Collect the final metrics
+    final_metrics = metrics['train']
+    final_f1_score = 2 * final_metrics['recall'] * final_metrics['precision'] / (
+            final_metrics['recall'] + final_metrics['precision'])
+
+    # Update the best score and params
+    if final_f1_score > best_score:
+        best_score = final_f1_score
+        best_params = params
+    print(f"F1-Score for current params: {final_f1_score}")
+    print(f"Best F1-Score so far: {best_score} with params: {best_params}")
+
+print(f"Best params found: {best_params} with F1-Score: {best_score}")

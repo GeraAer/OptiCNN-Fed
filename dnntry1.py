@@ -44,7 +44,7 @@ data_processed = pd.DataFrame(features_scaled, columns=features.columns)
 data_processed['Label'] = labels_encoded
 
 # Split the dataset into training and testing sets
-traindata = data_processed.sample(frac=0.8, random_state=42)
+traindata = data_processed.sample(frac=0.8, random_state=129)
 testdata = data_processed.drop(traindata.index)
 
 # Reset index
@@ -53,9 +53,9 @@ testdata = testdata.reset_index(drop=True)
 
 # Define constants
 CLIENTS_NUM = 5
-ROUND_NUM = 200
-client_lr = 0.02
-server_lr = 1.0
+ROUND_NUM = 2000
+client_lr = 0.01
+server_lr = 0.5
 batchSize = 64
 
 # Split training data among clients
@@ -113,7 +113,7 @@ def preprocess_dataset(dataset):
             y=tf.reshape(input[:, -1], [-1, 1])
         )
 
-    return dataset.batch(batchSize).map(map_fn).take(120000)
+    return dataset.batch(batchSize).map(map_fn)
 
 
 # Generate federated datasets
@@ -127,7 +127,7 @@ input_spec = federated_train_datasets[0].element_spec
 # Federated Learning Model
 def create_keras_model():
     model = tf.keras.Sequential()
-    model.add(tf.keras.layers.Dense(1024, input_dim=128, activation=tf.nn.relu))  # Adjusted input_dim to 128
+    model.add(tf.keras.layers.Dense(1024, input_dim=128, activation=tf.nn.swish))  # Adjusted input_dim to 128
     model.add(tf.keras.layers.Dropout(0.01))
     model.add(tf.keras.layers.Dense(1))
     model.add(tf.keras.layers.Activation('sigmoid'))
